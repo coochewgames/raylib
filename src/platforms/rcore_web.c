@@ -89,6 +89,14 @@ extern CoreData CORE;                   // Global CORE state context
 
 static PlatformData platform = { 0 };   // Platform specific data
 
+// LOCAL PATCH: sub-frame mouse-tap latch. On web, mouse callbacks fire between frames,
+// so a fast tap (e.g. macOS trackpad tap-to-click) can deliver mousedown+mouseup within
+// a single rendered frame, leaving currentButtonState back at 0 before the frame samples
+// input -> IsMouseButtonPressed() never sees it. We hold a press for at least one frame
+// and defer its release by one frame so taps are not dropped. (Affects web build only.)
+static bool mouseButtonPressPending[MAX_MOUSE_BUTTONS] = { 0 };   // press not yet sampled by a frame
+static bool mouseButtonReleaseDeferred[MAX_MOUSE_BUTTONS] = { 0 }; // release waiting to apply at next poll
+
 //----------------------------------------------------------------------------------
 // Global Variables Definition
 //----------------------------------------------------------------------------------
@@ -1103,6 +1111,19 @@ void PollInputEvents(void)
     // Register previous mouse states
     for (int i = 0; i < MAX_MOUSE_BUTTONS; i++) CORE.Input.Mouse.previousButtonState[i] = CORE.Input.Mouse.currentButtonState[i];
 
+    // LOCAL PATCH: the just-rendered frame has now sampled the current button states, so any
+    // pending press has been seen. Apply releases that were deferred to keep a tap visible.
+    for (int i = 0; i < MAX_MOUSE_BUTTONS; i++)
+    {
+        mouseButtonPressPending[i] = false;
+        if (mouseButtonReleaseDeferred[i])
+        {
+            CORE.Input.Mouse.currentButtonState[i] = 0;
+            CORE.Input.Touch.currentTouchState[i] = 0;
+            mouseButtonReleaseDeferred[i] = false;
+        }
+    }
+
     // Register previous mouse wheel state
     CORE.Input.Mouse.previousWheelMove = CORE.Input.Mouse.currentWheelMove;
     CORE.Input.Mouse.currentWheelMove = (Vector2){ 0.0f, 0.0f };
@@ -1631,8 +1652,24 @@ static void MouseButtonCallback(GLFWwindow *window, int button, int action, int 
 {
     // WARNING: GLFW could only return GLFW_PRESS (1) or GLFW_RELEASE (0) for now,
     // but future releases may add more actions (i.e. GLFW_REPEAT)
-    CORE.Input.Mouse.currentButtonState[button] = action;
-    CORE.Input.Touch.currentTouchState[button] = action;
+    // LOCAL PATCH: latch sub-frame taps (see mouseButtonPressPending globals) so fast
+    // mousedown+mouseup within one frame is not dropped by per-frame input sampling.
+    if (action == 1) // GLFW_PRESS
+    {
+        CORE.Input.Mouse.currentButtonState[button] = 1;
+        CORE.Input.Touch.currentTouchState[button] = 1;
+        mouseButtonPressPending[button] = true;
+        mouseButtonReleaseDeferred[button] = false;
+    }
+    else // GLFW_RELEASE
+    {
+        if (mouseButtonPressPending[button]) mouseButtonReleaseDeferred[button] = true; // hold press one frame
+        else
+        {
+            CORE.Input.Mouse.currentButtonState[button] = 0;
+            CORE.Input.Touch.currentTouchState[button] = 0;
+        }
+    }
 
 #if SUPPORT_GESTURES_SYSTEM && SUPPORT_MOUSE_GESTURES
     // Process mouse events as touches to be able to use mouse-gestures
